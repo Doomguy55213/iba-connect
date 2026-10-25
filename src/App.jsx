@@ -8,7 +8,6 @@ import {
 
 const CATEGORIES = ['Sports & Rec', 'Study & Homework', 'Food & Coffee', 'Casual Hangout'];
 
-// Helper logic for Course Outline Parsing & Roadmap Generation
 function parseCourseOutline(outlineText, maxTopicOrWeek) {
   if (!outlineText.trim()) return [];
   const lines = outlineText.split(/\n+/).map(l => l.trim()).filter(l => l.length > 0);
@@ -49,7 +48,8 @@ function buildInteractivePlan(topics, completedIds, targetDays = 5) {
 }
 
 export default function App() {
-  // User Profile State
+  // Authentication & Profile State
+  const [session, setSession] = useState(null);
   const [currentUser, setCurrentUser] = useState(null);
   const [nameInput, setNameInput] = useState('');
   const [contactInput, setContactInput] = useState('');
@@ -60,7 +60,7 @@ export default function App() {
   const [showLostFoundModal, setShowLostFoundModal] = useState(false);
   const [showCarpoolModal, setShowCarpoolModal] = useState(false);
 
-  // Chat & Notification Side Drawer State
+  // Chat & Drawer State
   const [isChatDrawerOpen, setIsChatDrawerOpen] = useState(false);
   const [activeGroupChat, setActiveGroupChat] = useState(null); 
   const [joinedChatGroups, setJoinedChatGroups] = useState([]);
@@ -73,9 +73,9 @@ export default function App() {
   const [events, setEvents] = useState([]);
   const [newEvent, setNewEvent] = useState({ title: '', location: '', category: CATEGORIES[0], capacity: 4 });
   
-  // 1-on-1 & Multi-Matching State
+  // Matching State
   const [matchCategory, setMatchCategory] = useState(CATEGORIES[0]);
-  const [allowGroupMatch, setAllowGroupMatch] = useState(false); // Toggle for accepting 2+ matches
+  const [allowGroupMatch, setAllowGroupMatch] = useState(false);
   const [matchingStatus, setMatchingStatus] = useState('idle');
   const [matchedPartner, setMatchedPartner] = useState(null);
   const [queueRecordId, setQueueRecordId] = useState(null);
@@ -98,18 +98,33 @@ export default function App() {
   const [interactivePlan, setInteractivePlan] = useState([]);
   const [isOutlineAnalyzed, setIsOutlineAnalyzed] = useState(false);
 
+  // Initialize Supabase Auth Session & Local Profile
   useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      if (!session) {
+        supabase.auth.signInAnonymously();
+      }
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+    });
+
     const savedUser = localStorage.getItem('campus_user');
     if (savedUser) {
       setCurrentUser(JSON.parse(savedUser));
     }
+
     fetchEvents();
     fetchLostFound();
     fetchCarpools();
     fetchLocations();
+
+    return () => subscription.unsubscribe();
   }, []);
 
-  // Poll chat messages if a chat group is active
+  // Poll chat messages
   useEffect(() => {
     let interval = null;
     if (activeGroupChat) {
@@ -124,7 +139,7 @@ export default function App() {
     let interval = null;
     if (matchingStatus === 'searching' && queueRecordId) {
       interval = setInterval(async () => {
-        await checkQueueForMatch();
+        await executeAtomicMatchCheck();
       }, 3000);
     }
     return () => clearInterval(interval);
@@ -170,7 +185,6 @@ export default function App() {
     setHasUnreadNotifs(true);
   };
 
-  // Immediate Auto-Analysis File Upload Handler
   const handleImmediateFileUpload = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -206,7 +220,8 @@ export default function App() {
     setCurrentUser(user);
   };
 
-  const handleSignOut = () => {
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
     localStorage.removeItem('campus_user');
     setCurrentUser(null);
     setNameInput('');
@@ -264,12 +279,21 @@ export default function App() {
     }
   };
 
+  // ATOMIC EVENT JOINING HANDLER (RPC)
   const handleJoinEvent = async (event) => {
-    if (event.joined_count >= event.capacity) return;
-    const { error } = await supabase.from('events').update({ joined_count: event.joined_count + 1 }).eq('id', event.id);
-    if (!error) {
+    const { data, error } = await supabase.rpc('join_event_atomic', { p_event_id: event.id });
+
+    if (error) {
+      alert(`Error joining event: ${error.message}`);
+      return;
+    }
+
+    if (data && data.success) {
       const groupObj = { id: `event_${event.id}`, title: event.title, type: 'Event' };
       addNotificationAndGroup(groupObj, `You joined "${event.title}". Added to group chat!`);
+      fetchEvents();
+    } else if (data && !data.success) {
+      alert(data.message);
       fetchEvents();
     }
   };
@@ -307,12 +331,21 @@ export default function App() {
     }
   };
 
+  // ATOMIC CARPOOL SEAT CLAIM HANDLER (RPC)
   const handleClaimCarpoolSeat = async (ride) => {
-    if (ride.joined_count >= ride.available_seats) return;
-    const { error } = await supabase.from('carpools').update({ joined_count: ride.joined_count + 1 }).eq('id', ride.id);
-    if (!error) {
+    const { data, error } = await supabase.rpc('claim_carpool_seat_atomic', { p_carpool_id: ride.id });
+
+    if (error) {
+      alert(`Error claiming seat: ${error.message}`);
+      return;
+    }
+
+    if (data && data.success) {
       const groupObj = { id: `carpool_${ride.id}`, title: `Ride to ${ride.destination}`, type: 'Carpool' };
       addNotificationAndGroup(groupObj, `Seat accepted for ride to "${ride.destination}". Added to group chat!`);
+      fetchCarpools();
+    } else if (data && !data.success) {
+      alert(data.message);
       fetchCarpools();
     }
   };
@@ -343,7 +376,7 @@ export default function App() {
     }
   };
 
-  // Enhanced Matching Algorithm with Group Matching support & Automatic Chat Creation
+  // ATOMIC MATCHING HANDLER (RPC)
   const startMatchingSearch = async () => {
     setMatchingStatus('searching');
     setMatchedPartner(null);
@@ -353,66 +386,34 @@ export default function App() {
       contact_handle: currentUser.contact,
       category: matchCategory,
       status: 'searching',
-      allow_group: allowGroupMatch,
-      group_capacity: allowGroupMatch ? 3 : 2,
-      current_members: 1
+      allow_group: allowGroupMatch
     };
 
-    const { data, error } = await supabase
-      .from('hangout_queue')
-      .insert([payload])
-      .select();
+    const { data, error } = await supabase.from('hangout_queue').insert([payload]).select();
 
     if (!error && data && data.length > 0) {
       setQueueRecordId(data[0].id);
     }
   };
 
-  const checkQueueForMatch = async () => {
+  const executeAtomicMatchCheck = async () => {
     if (!queueRecordId || !currentUser) return;
 
-    const { data: myRecord } = await supabase.from('hangout_queue').select('*').eq('id', queueRecordId).single();
+    const { data, error } = await supabase.rpc('process_queue_match', {
+      p_queue_id: queueRecordId,
+      p_category: matchCategory,
+      p_user_name: currentUser.name,
+      p_contact: currentUser.contact,
+      p_allow_group: allowGroupMatch
+    });
 
-    if (myRecord && myRecord.status === 'matched') {
-      const partner = { name: myRecord.matched_user_name, contact: myRecord.matched_contact };
+    if (!error && data && data.matched) {
+      const partner = { name: data.partner_name, contact: data.partner_contact };
       setMatchedPartner(partner);
       setMatchingStatus('matched');
 
-      // Create or Join Automatic Chat
-      const chatGroupId = `match_${myRecord.id}`;
-      const groupObj = { id: chatGroupId, title: `${matchCategory} Hangout`, type: 'Hangout' };
-      addNotificationAndGroup(groupObj, `Matched with ${partner.name}! Private chat created.`);
-      return;
-    }
-
-    // Query available partners allowing 1-on-1 or multi-matches
-    const { data: availablePartners } = await supabase
-      .from('hangout_queue')
-      .select('*')
-      .eq('category', matchCategory)
-      .eq('status', 'searching')
-      .neq('id', queueRecordId)
-      .limit(1);
-
-    if (availablePartners && availablePartners.length > 0) {
-      const partner = availablePartners[0];
-      const matchChatId = `match_${partner.id}`;
-
-      await supabase.from('hangout_queue').update({ 
-        status: 'matched', 
-        matched_user_name: currentUser.name, 
-        matched_contact: currentUser.contact 
-      }).eq('id', partner.id);
-
-      await supabase.from('hangout_queue').update({ status: 'matched' }).eq('id', queueRecordId);
-
-      const matchedObj = { name: partner.user_name, contact: partner.contact_handle };
-      setMatchedPartner(matchedObj);
-      setMatchingStatus('matched');
-
-      // Automatically create direct/group chat in drawer
-      const groupObj = { id: matchChatId, title: `${matchCategory} Hangout`, type: 'Hangout' };
-      addNotificationAndGroup(groupObj, `Matched with ${partner.user_name}! Private chat created.`);
+      const groupObj = { id: data.chat_id, title: `${matchCategory} Group`, type: 'Hangout' };
+      addNotificationAndGroup(groupObj, `Matched with ${partner.name}! Group chat created.`);
     }
   };
 
@@ -477,7 +478,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#FAFAFA] text-slate-800 flex flex-col max-w-md mx-auto shadow-xl relative overflow-x-hidden">
-      {/* Minimalist Header */}
+      {/* Header */}
       <header className="p-5 bg-[#800020] text-white sticky top-0 z-10 flex justify-between items-center shadow-sm">
         <div>
           <h1 className="font-semibold text-xl tracking-tight text-white">Discover</h1>
@@ -507,7 +508,7 @@ export default function App() {
         </div>
       </header>
 
-      {/* Navigation Sub-Header Bar */}
+      {/* Navigation Bar */}
       <div className="flex bg-white border-b border-slate-100 overflow-x-auto scrollbar-none px-2">
         <button
           onClick={() => setActiveTab('events')}
@@ -926,7 +927,7 @@ export default function App() {
 
                 <div className="flex items-center justify-between bg-slate-50 p-2.5 rounded-xl border border-slate-100">
                   <div>
-                    <p className="text-xs font-semibold text-slate-800">Allow Multi-Matching</p>
+                    <p className="text-xs font-semibold text-slate-800">Allow Group Matching</p>
                     <p className="text-[10px] text-slate-400">Match with up to 3 peers</p>
                   </div>
                   <input
@@ -1017,7 +1018,7 @@ export default function App() {
         )}
       </button>
 
-      {/* Direct Messaging & Notification Side Drawer */}
+      {/* Direct Messaging Drawer */}
       {isChatDrawerOpen && (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex justify-end">
           <div className="bg-white w-full max-w-xs h-full flex flex-col shadow-2xl transition-all">
