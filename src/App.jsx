@@ -8,6 +8,7 @@ import {
 
 const CATEGORIES = ['Sports & Rec', 'Study & Homework', 'Food & Coffee', 'Casual Hangout'];
 
+// Helper logic for Course Outline Parsing & Roadmap Generation
 function parseCourseOutline(outlineText, maxTopicOrWeek) {
   if (!outlineText.trim()) return [];
   const lines = outlineText.split(/\n+/).map(l => l.trim()).filter(l => l.length > 0);
@@ -61,8 +62,8 @@ export default function App() {
 
   // Chat & Notification Side Drawer State
   const [isChatDrawerOpen, setIsChatDrawerOpen] = useState(false);
-  const [activeGroupChat, setActiveGroupChat] = useState(null); // { id: 'event_123', title: 'Badminton' }
-  const [joinedChatGroups, setJoinedChatGroups] = useState([]); // List of chats user belongs to
+  const [activeGroupChat, setActiveGroupChat] = useState(null); 
+  const [joinedChatGroups, setJoinedChatGroups] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [chatMessages, setChatMessages] = useState([]);
   const [newMessageText, setNewMessageText] = useState('');
@@ -71,10 +72,14 @@ export default function App() {
   // Feed States
   const [events, setEvents] = useState([]);
   const [newEvent, setNewEvent] = useState({ title: '', location: '', category: CATEGORIES[0], capacity: 4 });
+  
+  // 1-on-1 & Multi-Matching State
   const [matchCategory, setMatchCategory] = useState(CATEGORIES[0]);
+  const [allowGroupMatch, setAllowGroupMatch] = useState(false); // Toggle for accepting 2+ matches
   const [matchingStatus, setMatchingStatus] = useState('idle');
   const [matchedPartner, setMatchedPartner] = useState(null);
   const [queueRecordId, setQueueRecordId] = useState(null);
+
   const [lostFoundItems, setLostFoundItems] = useState([]);
   const [newItem, setNewItem] = useState({ item_title: '', description: '', location: '', status: 'LOST', image_url: '' });
   const [carpools, setCarpools] = useState([]);
@@ -338,13 +343,24 @@ export default function App() {
     }
   };
 
+  // Enhanced Matching Algorithm with Group Matching support & Automatic Chat Creation
   const startMatchingSearch = async () => {
     setMatchingStatus('searching');
     setMatchedPartner(null);
 
+    const payload = {
+      user_name: currentUser.name,
+      contact_handle: currentUser.contact,
+      category: matchCategory,
+      status: 'searching',
+      allow_group: allowGroupMatch,
+      group_capacity: allowGroupMatch ? 3 : 2,
+      current_members: 1
+    };
+
     const { data, error } = await supabase
       .from('hangout_queue')
-      .insert([{ user_name: currentUser.name, contact_handle: currentUser.contact, category: matchCategory, status: 'searching' }])
+      .insert([payload])
       .select();
 
     if (!error && data && data.length > 0) {
@@ -358,11 +374,18 @@ export default function App() {
     const { data: myRecord } = await supabase.from('hangout_queue').select('*').eq('id', queueRecordId).single();
 
     if (myRecord && myRecord.status === 'matched') {
-      setMatchedPartner({ name: myRecord.matched_user_name, contact: myRecord.matched_contact });
+      const partner = { name: myRecord.matched_user_name, contact: myRecord.matched_contact };
+      setMatchedPartner(partner);
       setMatchingStatus('matched');
+
+      // Create or Join Automatic Chat
+      const chatGroupId = `match_${myRecord.id}`;
+      const groupObj = { id: chatGroupId, title: `${matchCategory} Hangout`, type: 'Hangout' };
+      addNotificationAndGroup(groupObj, `Matched with ${partner.name}! Private chat created.`);
       return;
     }
 
+    // Query available partners allowing 1-on-1 or multi-matches
     const { data: availablePartners } = await supabase
       .from('hangout_queue')
       .select('*')
@@ -373,11 +396,23 @@ export default function App() {
 
     if (availablePartners && availablePartners.length > 0) {
       const partner = availablePartners[0];
-      await supabase.from('hangout_queue').update({ status: 'matched', matched_user_name: currentUser.name, matched_contact: currentUser.contact }).eq('id', partner.id);
+      const matchChatId = `match_${partner.id}`;
+
+      await supabase.from('hangout_queue').update({ 
+        status: 'matched', 
+        matched_user_name: currentUser.name, 
+        matched_contact: currentUser.contact 
+      }).eq('id', partner.id);
+
       await supabase.from('hangout_queue').update({ status: 'matched' }).eq('id', queueRecordId);
 
-      setMatchedPartner({ name: partner.user_name, contact: partner.contact_handle });
+      const matchedObj = { name: partner.user_name, contact: partner.contact_handle };
+      setMatchedPartner(matchedObj);
       setMatchingStatus('matched');
+
+      // Automatically create direct/group chat in drawer
+      const groupObj = { id: matchChatId, title: `${matchCategory} Hangout`, type: 'Hangout' };
+      addNotificationAndGroup(groupObj, `Matched with ${partner.user_name}! Private chat created.`);
     }
   };
 
@@ -512,7 +547,7 @@ export default function App() {
             activeTab === 'matching' ? 'border-[#800020] text-[#800020]' : 'border-transparent text-slate-400 hover:text-slate-600'
           }`}
         >
-          <UserPlus size={14} /> 1-on-1
+          <UserPlus size={14} /> Matching
         </button>
         <button
           onClick={() => setActiveTab('lostfound')}
@@ -606,7 +641,9 @@ export default function App() {
                       }`}>
                         {ride.type === 'OFFER' ? 'Car Offered' : 'Ride Needed'}
                       </span>
-                      <h3 className="font-semibold text-slate-900 text-sm">{ride.origin} $\rightarrow$ {ride.destination}</h3>
+                      <h3 className="font-semibold text-slate-900 text-sm">
+                        {ride.origin} → {ride.destination}
+                      </h3>
                     </div>
 
                     <div className="text-xs text-slate-500 space-y-1">
@@ -629,10 +666,22 @@ export default function App() {
                           onClick={() => handleClaimCarpoolSeat(ride)}
                           disabled={isFull}
                           className={`text-xs px-3.5 py-1.5 rounded-lg font-medium transition ${
-                            isFull ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : 'bg-[#800020] text-white'
+                            isFull ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : 'bg-[#800020] text-white hover:bg-[#660019]'
                           }`}
                         >
                           {isFull ? 'Full' : 'Accept Ride'}
+                        </button>
+                      )}
+
+                      {ride.type === 'REQUEST' && (
+                        <button
+                          onClick={() => {
+                            const groupObj = { id: `carpool_${ride.id}`, title: `Ride to ${ride.destination}`, type: 'Carpool' };
+                            addNotificationAndGroup(groupObj, `You offered a ride to ${ride.creator_name}! Group chat created.`);
+                          }}
+                          className="text-xs px-3.5 py-1.5 rounded-lg font-medium bg-[#800020] text-white hover:bg-[#660019] transition"
+                        >
+                          Offer Ride
                         </button>
                       )}
                     </div>
@@ -856,26 +905,43 @@ export default function App() {
         )}
 
         {activeTab === 'matching' && (
-          <div className="space-y-4 text-center py-8">
-            <h2 className="text-xl font-bold text-slate-800">1-on-1 Hangout</h2>
-            <p className="text-xs text-slate-400">Match with someone free on campus right now.</p>
+          <div className="space-y-4 text-center py-6">
+            <h2 className="text-xl font-bold text-slate-800">Hangout Matching</h2>
+            <p className="text-xs text-slate-400">Match 1-on-1 or join small groups instantly on campus.</p>
 
             {matchingStatus === 'idle' && (
-              <div className="bg-white border border-slate-100 p-6 rounded-2xl space-y-3 max-w-xs mx-auto shadow-sm">
-                <select
-                  value={matchCategory}
-                  onChange={(e) => setMatchCategory(e.target.value)}
-                  className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs text-slate-800"
-                >
-                  {CATEGORIES.map((cat) => (
-                    <option key={cat} value={cat}>{cat}</option>
-                  ))}
-                </select>
+              <div className="bg-white border border-slate-100 p-6 rounded-2xl space-y-4 max-w-xs mx-auto shadow-sm text-left">
+                <div>
+                  <label className="text-[11px] text-slate-400 font-medium uppercase block mb-1">Select Activity</label>
+                  <select
+                    value={matchCategory}
+                    onChange={(e) => setMatchCategory(e.target.value)}
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl p-2.5 text-xs text-slate-800 focus:outline-none focus:border-[#800020]"
+                  >
+                    {CATEGORIES.map((cat) => (
+                      <option key={cat} value={cat}>{cat}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="flex items-center justify-between bg-slate-50 p-2.5 rounded-xl border border-slate-100">
+                  <div>
+                    <p className="text-xs font-semibold text-slate-800">Allow Multi-Matching</p>
+                    <p className="text-[10px] text-slate-400">Match with up to 3 peers</p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={allowGroupMatch}
+                    onChange={(e) => setAllowGroupMatch(e.target.checked)}
+                    className="accent-[#800020] w-4 h-4 rounded cursor-pointer"
+                  />
+                </div>
+
                 <button
                   onClick={startMatchingSearch}
-                  className="w-full bg-[#800020] text-white text-xs py-2.5 rounded-xl font-medium"
+                  className="w-full bg-[#800020] text-white text-xs py-3 rounded-xl font-medium transition hover:bg-[#660019]"
                 >
-                  Find Partner
+                  Start Matching
                 </button>
               </div>
             )}
@@ -883,17 +949,28 @@ export default function App() {
             {matchingStatus === 'searching' && (
               <div className="bg-white border border-slate-100 p-6 rounded-2xl space-y-3 max-w-xs mx-auto shadow-sm">
                 <RefreshCw size={24} className="animate-spin text-[#800020] mx-auto" />
-                <p className="text-xs text-slate-600">Searching for available partner...</p>
-                <button onClick={cancelSearch} className="text-xs text-[#800020] underline">Cancel</button>
+                <p className="text-xs text-slate-600">Looking for available peers for {matchCategory}...</p>
+                <button onClick={cancelSearch} className="text-xs text-[#800020] underline">Cancel Search</button>
               </div>
             )}
 
             {matchingStatus === 'matched' && matchedPartner && (
-              <div className="bg-white border border-slate-100 p-6 rounded-2xl space-y-2 max-w-xs mx-auto shadow-sm">
-                <h3 className="text-base font-bold text-[#800020]">Match Found!</h3>
-                <p className="text-xs text-slate-700 font-semibold">{matchedPartner.name}</p>
-                <p className="text-xs text-slate-400">{matchedPartner.contact}</p>
-                <button onClick={() => setMatchingStatus('idle')} className="w-full bg-slate-100 text-xs py-2 rounded-xl text-slate-700 mt-2">Done</button>
+              <div className="bg-white border border-slate-100 p-6 rounded-2xl space-y-3 max-w-xs mx-auto shadow-sm">
+                <h3 className="text-base font-bold text-[#800020]">Matched Successfully! 🎉</h3>
+                <div className="bg-slate-50 p-3 rounded-xl border border-slate-100 text-xs">
+                  <p className="font-bold text-slate-800">{matchedPartner.name}</p>
+                  <p className="text-slate-500 text-[11px] mt-0.5">{matchedPartner.contact}</p>
+                </div>
+                <p className="text-[11px] text-slate-400">An automatic group chat has been added to your direct messages drawer.</p>
+                <button 
+                  onClick={() => {
+                    setMatchingStatus('idle');
+                    setIsChatDrawerOpen(true);
+                  }} 
+                  className="w-full bg-[#800020] text-white text-xs py-2.5 rounded-xl font-medium"
+                >
+                  Open Chat
+                </button>
               </div>
             )}
           </div>
@@ -926,7 +1003,7 @@ export default function App() {
         )}
       </main>
 
-      {/* INSTAGRAM-STYLE FLOATING CHAT & NOTIFICATIONS BUTTON */}
+      {/* Floating Chat Button */}
       <button
         onClick={() => {
           setIsChatDrawerOpen(true);
@@ -940,11 +1017,10 @@ export default function App() {
         )}
       </button>
 
-      {/* INSTAGRAM-STYLE DIRECT MESSAGES & NOTIFICATIONS SIDE DRAWER */}
+      {/* Direct Messaging & Notification Side Drawer */}
       {isChatDrawerOpen && (
         <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm z-50 flex justify-end">
           <div className="bg-white w-full max-w-xs h-full flex flex-col shadow-2xl transition-all">
-            {/* Drawer Header */}
             <div className="p-4 border-b border-slate-100 flex justify-between items-center bg-[#800020] text-white">
               <div className="flex items-center gap-2">
                 <MessageCircle size={18} />
@@ -955,10 +1031,8 @@ export default function App() {
               </button>
             </div>
 
-            {/* Content Switcher: Chat List / Chat Window */}
             {!activeGroupChat ? (
               <div className="flex-1 overflow-y-auto p-4 space-y-4">
-                {/* Notifications Section */}
                 <div className="space-y-2">
                   <h4 className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1">
                     <Bell size={12} /> Recent Alerts
@@ -977,13 +1051,12 @@ export default function App() {
 
                 <hr className="border-slate-100" />
 
-                {/* Group Conversations List */}
                 <div className="space-y-2">
-                  <h4 className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Your Activity Groups</h4>
+                  <h4 className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Your Active Chats</h4>
                   {joinedChatGroups.length === 0 ? (
                     <div className="text-center py-8 text-xs text-slate-400">
-                      <p>You haven't joined any event or carpool chats yet.</p>
-                      <p className="text-[10px] mt-1 text-slate-300">Accept a ride or join an event to start chatting!</p>
+                      <p>You haven't joined any chats yet.</p>
+                      <p className="text-[10px] mt-1 text-slate-300">Match with peers or accept rides/events to chat!</p>
                     </div>
                   ) : (
                     joinedChatGroups.map((group) => (
@@ -997,7 +1070,7 @@ export default function App() {
                       >
                         <div>
                           <p className="font-semibold text-xs text-slate-800 group-hover:text-[#800020] transition">{group.title}</p>
-                          <span className="text-[10px] text-slate-400">{group.type} Group Chat</span>
+                          <span className="text-[10px] text-slate-400">{group.type} Chat</span>
                         </div>
                         <ChevronRight size={14} className="text-slate-300" />
                       </button>
@@ -1006,7 +1079,6 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              /* Active Chat Conversation Window */
               <div className="flex-1 flex flex-col h-full bg-slate-50">
                 <div className="p-3 bg-white border-b border-slate-100 flex items-center gap-2">
                   <button onClick={() => setActiveGroupChat(null)} className="text-xs text-[#800020] font-semibold hover:underline">
@@ -1017,7 +1089,7 @@ export default function App() {
 
                 <div className="flex-1 overflow-y-auto p-3 space-y-2">
                   {chatMessages.length === 0 ? (
-                    <p className="text-center text-xs text-slate-400 py-8">No messages yet. Say hello to your group!</p>
+                    <p className="text-center text-xs text-slate-400 py-8">No messages yet. Start the conversation!</p>
                   ) : (
                     chatMessages.map((msg) => {
                       const isMe = msg.sender_name === currentUser.name;
